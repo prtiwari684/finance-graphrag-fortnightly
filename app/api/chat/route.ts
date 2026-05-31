@@ -1,9 +1,25 @@
 import { NextResponse } from 'next/server';
 import { GoogleGenAI } from '@google/genai';
 import { getNeo4jDriver } from '@/lib/neo4j';
-import neo4j from 'neo4j-driver'; 
+import neo4j from 'neo4j-driver';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+// Initialise rate limiter — 10 requests per user IP per minute (sliding window)
+const ratelimit =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? new Ratelimit({
+        redis: new Redis({
+          url: process.env.UPSTASH_REDIS_REST_URL,
+          token: process.env.UPSTASH_REDIS_REST_TOKEN,
+        }),
+        limiter: Ratelimit.slidingWindow(10, '1 m'),
+        analytics: true,
+        prefix: 'finance-graphrag',
+      })
+    : null;
 
 // Recursively flatten Neo4j Integer/Float objects
 function flattenNeo4j(value: any): any {
@@ -11,7 +27,6 @@ function flattenNeo4j(value: any): any {
   if (value instanceof neo4j.types.Integer) return value.toNumber();
   if (Array.isArray(value)) return value.map(flattenNeo4j);
   if (value !== null && typeof value === 'object') {
-    // Neo4j node/relationship objects have a `.properties` field
     if (value.properties) return flattenNeo4j(value.properties);
     return Object.fromEntries(
       Object.entries(value).map(([k, v]) => [k, flattenNeo4j(v)])
@@ -21,8 +36,46 @@ function flattenNeo4j(value: any): any {
 }
 
 export async function POST(req: Request) {
+  // ── Rate limiting ──────────────────────────────────────────────────────────
+  if (ratelimit) {
+    // Use the real client IP; fall back to a static key for local dev
+    const ip =
+      req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+      req.headers.get('x-real-ip') ??
+      '127.0.0.1';
+
+    const { success, limit, remaining, reset } = await ratelimit.limit(ip);
+
+    if (!success) {
+      return NextResponse.json(
+        {
+          error: 'Too many requests. Please wait a moment before querying again.',
+          limit,
+          remaining,
+          reset,
+        },
+        {
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': String(limit),
+            'X-RateLimit-Remaining': String(remaining),
+            'X-RateLimit-Reset': String(reset),
+          },
+        }
+      );
+    }
+  }
+
+  // ── Main pipeline ──────────────────────────────────────────────────────────
   try {
     const { question } = await req.json();
+
+    if (!question || typeof question !== 'string' || !question.trim()) {
+      return NextResponse.json(
+        { error: 'Question must be a non-empty string.' },
+        { status: 400 }
+      );
+    }
 
     const cypherPrompt = `
     You are a strict Text-to-Cypher translator for an Indian Mutual Fund Graph database.
@@ -48,18 +101,43 @@ export async function POST(req: Request) {
       contents: cypherPrompt,
     });
 
-    const cleanJsonText = cypherResult.text!.trim().replace(/```json|```/g, '');
-    const { cypher } = JSON.parse(cleanJsonText);
-    console.log('Generated Cypher:', cypher); // logging
+    // ── Cypher parse with safe error handling ──────────────────────────────
+    let cypher: string;
+    try {
+      const cleanJsonText = cypherResult.text!.trim().replace(/```json|```/g, '').trim();
+      const parsed = JSON.parse(cleanJsonText);
+      if (!parsed.cypher || typeof parsed.cypher !== 'string') {
+        throw new Error('Missing "cypher" key in model response.');
+      }
+      cypher = parsed.cypher;
+    } catch {
+      return NextResponse.json(
+        {
+          error: "Couldn't interpret your question into a graph query. Try rephrasing it — e.g. 'Which stocks does HDFC hold?' or 'Top sectors by allocation?'",
+        },
+        { status: 422 }
+      );
+    }
 
+    console.log('Generated Cypher:', cypher);
+
+    // ── Neo4j execution ────────────────────────────────────────────────────
     const driver = getNeo4jDriver();
     const session = driver.session();
     let graphFacts: any[] = [];
 
     try {
       const result = await session.run(cypher);
-      // Flatten Neo4j native types before JSON serialization
       graphFacts = result.records.map(record => flattenNeo4j(record.toObject()));
+    } catch (dbError: any) {
+      console.error('Neo4j query error:', dbError.message);
+      return NextResponse.json(
+        {
+          error: 'The generated query could not run against the database. Try rephrasing your question.',
+          cypher,
+        },
+        { status: 422 }
+      );
     } finally {
       await session.close();
     }
@@ -67,7 +145,6 @@ export async function POST(req: Request) {
     console.log('Graph facts count:', graphFacts.length);
     console.log('Graph facts sample:', JSON.stringify(graphFacts.slice(0, 3), null, 2));
 
-    // Tell Gemma what to do with empty results too
     const synthesisPrompt = `
       You are a financial data assistant. Answer the user's question using the database results below.
 
@@ -93,7 +170,6 @@ export async function POST(req: Request) {
       recordCount: graphFacts.length,
       answer: finalModelResponse.text,
     });
-
   } catch (error: any) {
     console.error('Execution Pipeline Failure:', error);
     return NextResponse.json(
